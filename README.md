@@ -66,6 +66,7 @@ Set these in Coolify:
 PORT=3000
 HOST=0.0.0.0
 DOWNLOAD_DIR=/app/.runtime/completed
+YTDLP_JS_RUNTIME=node
 ```
 
 ### Persistent storage
@@ -77,6 +78,26 @@ Recommended: mount persistent storage to:
 ```
 
 This keeps completed downloads available across container restarts.
+
+### YouTube bot-check fix
+
+Some YouTube videos require authenticated cookies. If the app shows `Sign in to confirm you're not a bot`, configure cookies in Coolify:
+
+1. Export a `cookies.txt` file from a browser where your YouTube account is already signed in.
+2. In Coolify, add a `File Mount`.
+3. Mount the host file to this container path:
+
+```text
+/app/.runtime/cookies/youtube-cookies.txt
+```
+
+4. Add this environment variable:
+
+```env
+YTDLP_COOKIE_FILE=/app/.runtime/cookies/youtube-cookies.txt
+```
+
+5. Redeploy the app.
 
 ### Post-deploy checks
 

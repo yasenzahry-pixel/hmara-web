@@ -145,6 +145,20 @@ function isAllowedProtocol(parsedUrl) {
   return Boolean(parsedUrl && (parsedUrl.protocol === 'https:' || parsedUrl.protocol === 'http:'));
 }
 
+function formatYtDlpError(detail, fallback) {
+  const normalized = String(detail || '').trim();
+
+  if (!normalized) {
+    return fallback;
+  }
+
+  if (normalized.includes('Sign in to confirm you’re not a bot') || normalized.includes("Sign in to confirm you're not a bot")) {
+    return 'YouTube blocked this request. Add exported YouTube cookies in Coolify and set YTDLP_COOKIE_FILE to the mounted cookie file path.';
+  }
+
+  return normalized;
+}
+
 function isAllowedVideoUrl(value) {
   const parsedUrl = parseUrlValue(value);
   if (!isAllowedProtocol(parsedUrl)) {
@@ -425,6 +439,7 @@ app.get('/config', async (req, res) => {
     deliveryMode: 'browser-download',
     storagePath: COMPLETED_DIR,
     browseSupported: false,
+    cookiesConfigured: Boolean(YTDLP_COOKIE_FILE),
     toolAvailability,
   });
 });
@@ -452,7 +467,7 @@ app.get('/info', async (req, res) => {
         return res.status(500).json({
           error: isTimeout
             ? 'Metadata request timed out. Try again.'
-            : detail || 'Failed to fetch info',
+            : formatYtDlpError(detail, 'Failed to fetch info'),
         });
       }
 
@@ -752,7 +767,7 @@ app.get('/download', async (req, res) => {
 
       if (code !== 0) {
         const detail = stderrBuffer.trim().split('\n').slice(-4).join(' | ');
-        sendEvent({ error: detail || 'Download failed' });
+        sendEvent({ error: formatYtDlpError(detail, 'Download failed') });
         return res.end();
       }
 
