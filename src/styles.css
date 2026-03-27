@@ -305,6 +305,15 @@ button:focus-visible {
   line-height: 1.65;
 }
 
+.landing-helper-row {
+  display: flex;
+  justify-content: center;
+}
+
+.helper-button {
+  min-width: 220px;
+}
+
 .landing-input {
   width: min(760px, 100%);
   margin: 10px auto 0;
@@ -455,7 +464,7 @@ button:focus-visible {
   display: grid;
   gap: 10px;
   margin-top: 4px;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .preview-card,
@@ -618,6 +627,89 @@ button:focus-visible {
 .details-section + .details-section {
   padding-top: 12px;
   border-top: 1px solid var(--line);
+}
+
+.modal-shell {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+}
+
+.modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.34);
+  backdrop-filter: blur(8px);
+}
+
+.cookie-modal {
+  position: relative;
+  width: min(760px, 100%);
+  padding: 24px;
+  display: grid;
+  gap: 16px;
+}
+
+.cookie-modal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.cookie-modal-head h2 {
+  margin: 8px 0 0;
+  font-family: 'Sora', sans-serif;
+  letter-spacing: -0.03em;
+}
+
+.cookie-copy {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.7;
+}
+
+.cookie-upload {
+  display: inline-flex;
+  width: fit-content;
+  align-items: center;
+  justify-content: center;
+  min-height: 48px;
+  padding: 0 18px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: #ffffff;
+  box-shadow: var(--shadow-lift);
+  position: relative;
+  overflow: hidden;
+  font-weight: 700;
+}
+
+.cookie-upload input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.cookie-textarea {
+  width: 100%;
+  min-height: 220px;
+  resize: vertical;
+  padding: 16px 18px;
+  border-radius: 20px;
+  border: 1px solid var(--line);
+  background: #fbfdff;
+  color: var(--ink);
+  box-shadow: inset 0 1px 2px rgba(15, 23, 42, 0.02);
+}
+
+.cookie-actions {
+  display: flex;
+  justify-content: flex-end;
 }
 
 .details-head {

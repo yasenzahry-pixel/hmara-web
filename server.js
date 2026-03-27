@@ -12,6 +12,8 @@ const ROOT_DIR = __dirname;
 const DIST_DIR = path.join(ROOT_DIR, 'dist');
 const RUNTIME_DIR = path.join(ROOT_DIR, '.runtime');
 const WORK_DIR = path.join(RUNTIME_DIR, 'work');
+const COOKIE_DIR = path.join(RUNTIME_DIR, 'cookies');
+const UPLOADED_COOKIE_FILE = path.join(COOKIE_DIR, 'youtube-cookies.txt');
 const COMPLETED_DIR = path.isAbsolute(process.env.DOWNLOAD_DIR || '')
   ? process.env.DOWNLOAD_DIR
   : path.resolve(ROOT_DIR, process.env.DOWNLOAD_DIR || path.join('.runtime', 'completed'));
@@ -22,10 +24,6 @@ const DOWNLOAD_TTL_MS = 1000 * 60 * 60;
 const YTDLP_JS_RUNTIME = String(process.env.YTDLP_JS_RUNTIME || 'node').trim();
 const YTDLP_COOKIE_FILE = String(process.env.YTDLP_COOKIE_FILE || '').trim();
 const YTDLP_NETWORK_ARGS = ['--force-ipv4'];
-const YTDLP_SHARED_ARGS = [
-  ...(YTDLP_JS_RUNTIME ? ['--js-runtimes', YTDLP_JS_RUNTIME] : []),
-  ...(YTDLP_COOKIE_FILE ? ['--cookies', YTDLP_COOKIE_FILE] : []),
-];
 const VIDEO_FORMAT_SELECTOR = [
   'bestvideo[vcodec^=avc1][height<=1080]+bestaudio[acodec^=mp4a]',
   'bestvideo[vcodec^=avc1][height<=1080]+bestaudio[ext=m4a]',
@@ -63,6 +61,7 @@ let toolAvailabilityPromise = null;
 const completedDownloads = new Map();
 
 app.use(cors());
+app.use(express.json({ limit: '2mb' }));
 app.use(express.static(DIST_DIR));
 
 async function fileExists(targetPath) {
@@ -143,6 +142,23 @@ function parseUrlValue(value) {
 
 function isAllowedProtocol(parsedUrl) {
   return Boolean(parsedUrl && (parsedUrl.protocol === 'https:' || parsedUrl.protocol === 'http:'));
+}
+
+function getActiveCookieFile() {
+  if (YTDLP_COOKIE_FILE) {
+    return YTDLP_COOKIE_FILE;
+  }
+
+  return fs.existsSync(UPLOADED_COOKIE_FILE) ? UPLOADED_COOKIE_FILE : '';
+}
+
+function buildYtDlpSharedArgs() {
+  const cookieFile = getActiveCookieFile();
+
+  return [
+    ...(YTDLP_JS_RUNTIME ? ['--js-runtimes', YTDLP_JS_RUNTIME] : []),
+    ...(cookieFile ? ['--cookies', cookieFile] : []),
+  ];
 }
 
 function formatYtDlpError(detail, fallback) {
@@ -346,7 +362,7 @@ function fetchExpectedDownloadBytes(url) {
   return new Promise((resolve) => {
     execFile(
       'yt-dlp',
-      [...YTDLP_NETWORK_ARGS, ...YTDLP_SHARED_ARGS, '-J', ...YTDLP_METADATA_ARGS, '-f', VIDEO_FORMAT_SELECTOR, url],
+      [...YTDLP_NETWORK_ARGS, ...buildYtDlpSharedArgs(), '-J', ...YTDLP_METADATA_ARGS, '-f', VIDEO_FORMAT_SELECTOR, url],
       { maxBuffer: 1024 * 1024 * 10, timeout: YTDLP_METADATA_TIMEOUT_MS },
       (error, stdout) => {
         if (error || !stdout) {
@@ -439,8 +455,28 @@ app.get('/config', async (req, res) => {
     deliveryMode: 'browser-download',
     storagePath: COMPLETED_DIR,
     browseSupported: false,
-    cookiesConfigured: Boolean(YTDLP_COOKIE_FILE),
+    cookiesConfigured: Boolean(getActiveCookieFile()),
     toolAvailability,
+  });
+});
+
+app.post('/cookies', async (req, res) => {
+  const content = String(req.body?.content || '');
+
+  if (!content.trim()) {
+    return res.status(400).json({ error: 'cookies.txt content is required' });
+  }
+
+  if (!content.includes('# Netscape HTTP Cookie File')) {
+    return res.status(400).json({ error: 'Upload a valid cookies.txt file in Netscape format' });
+  }
+
+  await ensureDirectory(COOKIE_DIR);
+  await fsp.writeFile(UPLOADED_COOKIE_FILE, content, 'utf8');
+
+  res.json({
+    ok: true,
+    cookiesConfigured: true,
   });
 });
 
@@ -457,7 +493,7 @@ app.get('/info', async (req, res) => {
 
   execFile(
     'yt-dlp',
-    [...YTDLP_NETWORK_ARGS, ...YTDLP_SHARED_ARGS, '-J', ...YTDLP_METADATA_ARGS, url],
+    [...YTDLP_NETWORK_ARGS, ...buildYtDlpSharedArgs(), '-J', ...YTDLP_METADATA_ARGS, url],
     { maxBuffer: 1024 * 1024 * 10, timeout: YTDLP_METADATA_TIMEOUT_MS },
     (error, stdout, stderr) => {
       if (error) {
@@ -594,7 +630,7 @@ app.get('/download', async (req, res) => {
   const expectedBytesPromise = fetchExpectedDownloadBytes(url);
   const args = [
     ...YTDLP_NETWORK_ARGS,
-    ...YTDLP_SHARED_ARGS,
+    ...buildYtDlpSharedArgs(),
     '--newline',
     '--progress',
     '--progress-template',
@@ -818,6 +854,7 @@ const PORT = Number(process.env.PORT) || 3000;
 app.listen(PORT, HOST, async () => {
   await ensureDirectory(WORK_DIR);
   await ensureDirectory(COMPLETED_DIR);
+  await ensureDirectory(COOKIE_DIR);
   const toolAvailability = await getToolAvailability();
   const localNetworkLabel = HOST === '0.0.0.0' ? os.hostname() : HOST;
 

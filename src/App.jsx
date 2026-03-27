@@ -122,6 +122,10 @@ export default function App() {
   const [toolAvailability, setToolAvailability] = useState({
     ytDlp: true,
   });
+  const [cookiesConfigured, setCookiesConfigured] = useState(false);
+  const [cookieModalOpen, setCookieModalOpen] = useState(false);
+  const [cookieText, setCookieText] = useState('');
+  const [cookieBusy, setCookieBusy] = useState(false);
   const [status, setStatus] = useState('Paste a YouTube URL to continue');
   const [statusTone, setStatusTone] = useState('info');
   const [busy, setBusy] = useState(false);
@@ -144,6 +148,8 @@ export default function App() {
           ytDlp: Boolean(res.data.toolAvailability.ytDlp),
         });
       }
+
+      setCookiesConfigured(Boolean(res.data?.cookiesConfigured));
 
       if (res.data?.toolAvailability?.ytDlp === false) {
         setStatus('yt-dlp is missing on the server');
@@ -197,8 +203,12 @@ export default function App() {
       if (requestId !== infoRequestRef.current) return;
       setInfo(emptyInfo);
       setActive(false);
-      setStatus(error?.response?.data?.error || error.message || 'Scan failed');
+      const message = error?.response?.data?.error || error.message || 'Scan failed';
+      setStatus(message);
       setStatusTone('error');
+      if (String(message).includes('Add exported YouTube cookies')) {
+        setCookieModalOpen(true);
+      }
     } finally {
       if (requestId === infoRequestRef.current) {
         setBusy(false);
@@ -333,6 +343,50 @@ export default function App() {
     }
   }
 
+  async function uploadCookieText(content) {
+    const trimmed = String(content || '').trim();
+
+    if (!trimmed) {
+      setStatus('Paste or upload a valid cookies.txt file');
+      setStatusTone('error');
+      return;
+    }
+
+    setCookieBusy(true);
+    setStatus('Uploading YouTube cookies...');
+    setStatusTone('info');
+
+    try {
+      const res = await api.post('/cookies', { content: trimmed });
+      setCookiesConfigured(Boolean(res.data?.cookiesConfigured));
+      setCookieModalOpen(false);
+      setCookieText('');
+      setStatus('YouTube cookies saved. Retry the URL now.');
+      setStatusTone('info');
+    } catch (error) {
+      setStatus(await resolveErrorMessage(error, 'Cookies upload failed'));
+      setStatusTone('error');
+    } finally {
+      setCookieBusy(false);
+    }
+  }
+
+  async function handleCookieFileChange(event) {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+
+    if (!file) return;
+
+    try {
+      const text = await file.text();
+      setCookieText(text);
+      await uploadCookieText(text);
+    } catch {
+      setStatus('Could not read the selected cookies file');
+      setStatusTone('error');
+    }
+  }
+
   function startDownload() {
     if (!url || !isSupportedVideoUrl(url)) {
       setStatus('Enter a valid YouTube URL');
@@ -377,6 +431,9 @@ export default function App() {
         setStatus(data.error);
         setStatusTone('error');
         setBusy(false);
+        if (String(data.error).includes('Add exported YouTube cookies')) {
+          setCookieModalOpen(true);
+        }
         closeSource();
       }
       if (data.done) {
@@ -412,6 +469,12 @@ export default function App() {
           <section className="surface-card landing-card">
             <h1 className="landing-title"><BrandWordmark stacked /></h1>
             <p>Paste a YouTube URL to preview metadata, download the video, and keep the flow clean.</p>
+
+            <div className="landing-helper-row">
+              <button className="button button-secondary helper-button" onClick={() => setCookieModalOpen(true)}>
+                {cookiesConfigured ? 'Update YouTube Cookies' : 'Add YouTube Cookies'}
+              </button>
+            </div>
 
             <label className="landing-input">
               <input
@@ -530,6 +593,12 @@ export default function App() {
 
             <div className="detail-actions">
               <button
+                className="button button-secondary"
+                onClick={() => setCookieModalOpen(true)}
+              >
+                {cookiesConfigured ? 'Update Cookies' : 'Add Cookies'}
+              </button>
+              <button
                 className="button button-primary"
                 onClick={startDownload}
                 disabled={busy || !url || !toolAvailability.ytDlp}
@@ -554,6 +623,50 @@ export default function App() {
           </section>
         )}
       </main>
+
+      {cookieModalOpen ? (
+        <div className="modal-shell" role="dialog" aria-modal="true" aria-label="YouTube cookies">
+          <div className="modal-backdrop" onClick={() => !cookieBusy && setCookieModalOpen(false)} />
+          <section className="surface-card cookie-modal">
+            <div className="cookie-modal-head">
+              <div>
+                <span className="field-label">YouTube Access</span>
+                <h2>Upload `cookies.txt`</h2>
+              </div>
+              <button className="mini-action" onClick={() => !cookieBusy && setCookieModalOpen(false)} disabled={cookieBusy}>
+                Close
+              </button>
+            </div>
+
+            <p className="cookie-copy">
+              Browsers do not allow this app to directly read your YouTube cookies. Export `cookies.txt` from your browser, then upload it here.
+            </p>
+
+            <label className="cookie-upload">
+              <input type="file" accept=".txt" onChange={handleCookieFileChange} disabled={cookieBusy} />
+              <span>{cookieBusy ? 'Uploading...' : 'Choose cookies.txt file'}</span>
+            </label>
+
+            <textarea
+              className="cookie-textarea"
+              value={cookieText}
+              onChange={(event) => setCookieText(event.target.value)}
+              placeholder="# Netscape HTTP Cookie File"
+              spellCheck="false"
+            />
+
+            <div className="cookie-actions">
+              <button
+                className="button button-primary"
+                onClick={() => uploadCookieText(cookieText)}
+                disabled={cookieBusy}
+              >
+                Save Cookies
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
     </div>
   );
 }
