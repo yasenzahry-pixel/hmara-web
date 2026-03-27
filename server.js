@@ -19,7 +19,13 @@ const TEMP_PREFIX = '__yt_root_tmp__';
 const FILEPATH_MARKER = '__FILEPATH__:';
 const PROGRESS_MARKER = '__PROGRESS__:';
 const DOWNLOAD_TTL_MS = 1000 * 60 * 60;
+const YTDLP_JS_RUNTIME = String(process.env.YTDLP_JS_RUNTIME || 'node').trim();
+const YTDLP_COOKIE_FILE = String(process.env.YTDLP_COOKIE_FILE || '').trim();
 const YTDLP_NETWORK_ARGS = ['--force-ipv4'];
+const YTDLP_SHARED_ARGS = [
+  ...(YTDLP_JS_RUNTIME ? ['--js-runtimes', YTDLP_JS_RUNTIME] : []),
+  ...(YTDLP_COOKIE_FILE ? ['--cookies', YTDLP_COOKIE_FILE] : []),
+];
 const VIDEO_FORMAT_SELECTOR = [
   'bestvideo[vcodec^=avc1][height<=1080]+bestaudio[acodec^=mp4a]',
   'bestvideo[vcodec^=avc1][height<=1080]+bestaudio[ext=m4a]',
@@ -326,7 +332,7 @@ function fetchExpectedDownloadBytes(url) {
   return new Promise((resolve) => {
     execFile(
       'yt-dlp',
-      [...YTDLP_NETWORK_ARGS, '-J', ...YTDLP_METADATA_ARGS, '-f', VIDEO_FORMAT_SELECTOR, url],
+      [...YTDLP_NETWORK_ARGS, ...YTDLP_SHARED_ARGS, '-J', ...YTDLP_METADATA_ARGS, '-f', VIDEO_FORMAT_SELECTOR, url],
       { maxBuffer: 1024 * 1024 * 10, timeout: YTDLP_METADATA_TIMEOUT_MS },
       (error, stdout) => {
         if (error || !stdout) {
@@ -436,7 +442,7 @@ app.get('/info', async (req, res) => {
 
   execFile(
     'yt-dlp',
-    [...YTDLP_NETWORK_ARGS, '-J', ...YTDLP_METADATA_ARGS, url],
+    [...YTDLP_NETWORK_ARGS, ...YTDLP_SHARED_ARGS, '-J', ...YTDLP_METADATA_ARGS, url],
     { maxBuffer: 1024 * 1024 * 10, timeout: YTDLP_METADATA_TIMEOUT_MS },
     (error, stdout, stderr) => {
       if (error) {
@@ -573,6 +579,7 @@ app.get('/download', async (req, res) => {
   const expectedBytesPromise = fetchExpectedDownloadBytes(url);
   const args = [
     ...YTDLP_NETWORK_ARGS,
+    ...YTDLP_SHARED_ARGS,
     '--newline',
     '--progress',
     '--progress-template',
