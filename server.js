@@ -1,16 +1,24 @@
 const express = require('express');
-const { spawn, exec, execFile } = require('child_process');
+const { spawn, execFile } = require('child_process');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
+const crypto = require('crypto');
 
 const fsp = fs.promises;
 const app = express();
 const ROOT_DIR = __dirname;
 const DIST_DIR = path.join(ROOT_DIR, 'dist');
+const RUNTIME_DIR = path.join(ROOT_DIR, '.runtime');
+const WORK_DIR = path.join(RUNTIME_DIR, 'work');
+const COMPLETED_DIR = path.isAbsolute(process.env.DOWNLOAD_DIR || '')
+  ? process.env.DOWNLOAD_DIR
+  : path.resolve(ROOT_DIR, process.env.DOWNLOAD_DIR || path.join('.runtime', 'completed'));
 const TEMP_PREFIX = '__yt_root_tmp__';
 const FILEPATH_MARKER = '__FILEPATH__:';
 const PROGRESS_MARKER = '__PROGRESS__:';
+const DOWNLOAD_TTL_MS = 1000 * 60 * 60;
 const YTDLP_NETWORK_ARGS = ['--force-ipv4'];
 const VIDEO_FORMAT_SELECTOR = [
   'bestvideo[vcodec^=avc1][height<=1080]+bestaudio[acodec^=mp4a]',
@@ -29,29 +37,27 @@ const YTDLP_METADATA_ARGS = [
   '1',
 ];
 const YTDLP_METADATA_TIMEOUT_MS = 30000;
+const VIDEO_HOSTS = new Set([
+  'youtube.com',
+  'www.youtube.com',
+  'm.youtube.com',
+  'music.youtube.com',
+  'youtu.be',
+  'www.youtu.be',
+]);
+const THUMBNAIL_HOST_SUFFIXES = ['ytimg.com', 'googleusercontent.com', 'ggpht.com'];
 const THUMBNAIL_CONTENT_TYPES = {
   'image/jpeg': '.jpg',
   'image/jpg': '.jpg',
   'image/png': '.png',
   'image/webp': '.webp',
 };
-const MP4_FAMILY_FORMATS = new Set(['mov', 'mp4', 'm4a', '3gp', '3g2', 'mj2']);
 
-let ffmpegEncodersPromise = null;
+let toolAvailabilityPromise = null;
+const completedDownloads = new Map();
 
 app.use(cors());
 app.use(express.static(DIST_DIR));
-app.use(express.static(ROOT_DIR));
-
-function resolveDestinationPath(downloadPath) {
-  if (!downloadPath) {
-    return ROOT_DIR;
-  }
-
-  return path.isAbsolute(downloadPath)
-    ? downloadPath
-    : path.resolve(ROOT_DIR, downloadPath);
-}
 
 async function fileExists(targetPath) {
   try {
@@ -92,8 +98,12 @@ async function moveFile(sourcePath, destinationPath) {
   }
 }
 
-async function findDownloadedFileFallback(prefix = TEMP_PREFIX) {
-  const entries = await fsp.readdir(ROOT_DIR);
+async function ensureDirectory(targetPath) {
+  await fsp.mkdir(targetPath, { recursive: true });
+}
+
+async function findDownloadedFileFallback(baseDir, prefix = TEMP_PREFIX) {
+  const entries = await fsp.readdir(baseDir);
   const prefixedFiles = entries.filter((entry) => entry.startsWith(prefix));
 
   if (prefixedFiles.length === 0) {
@@ -102,7 +112,7 @@ async function findDownloadedFileFallback(prefix = TEMP_PREFIX) {
 
   const detailed = await Promise.all(
     prefixedFiles.map(async (entry) => {
-      const fullPath = path.join(ROOT_DIR, entry);
+      const fullPath = path.join(baseDir, entry);
       const stats = await fsp.stat(fullPath);
       return { fullPath, mtimeMs: stats.mtimeMs };
     })
@@ -115,6 +125,42 @@ async function findDownloadedFileFallback(prefix = TEMP_PREFIX) {
 function readPositiveNumber(value) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function parseUrlValue(value) {
+  try {
+    return new URL(String(value || '').trim());
+  } catch {
+    return null;
+  }
+}
+
+function isAllowedProtocol(parsedUrl) {
+  return Boolean(parsedUrl && (parsedUrl.protocol === 'https:' || parsedUrl.protocol === 'http:'));
+}
+
+function isAllowedVideoUrl(value) {
+  const parsedUrl = parseUrlValue(value);
+  if (!isAllowedProtocol(parsedUrl)) {
+    return false;
+  }
+
+  return VIDEO_HOSTS.has(parsedUrl.hostname.toLowerCase());
+}
+
+function isAllowedThumbnailUrl(value) {
+  const parsedUrl = parseUrlValue(value);
+  if (!isAllowedProtocol(parsedUrl)) {
+    return false;
+  }
+
+  const host = parsedUrl.hostname.toLowerCase();
+  return THUMBNAIL_HOST_SUFFIXES.some((suffix) => host === suffix || host.endsWith(`.${suffix}`));
+}
+
+function normalizeExternalUrl(value) {
+  const parsedUrl = parseUrlValue(value);
+  return parsedUrl ? parsedUrl.toString() : '';
 }
 
 function sanitizeFileSegment(value, fallback = 'file') {
@@ -239,157 +285,22 @@ function inferThumbnailExtension(url, contentType) {
   }
 }
 
-function execFileCapture(command, args, options = {}) {
-  return new Promise((resolve, reject) => {
-    execFile(command, args, options, (error, stdout = '', stderr = '') => {
-      if (error) {
-        error.stdout = stdout;
-        error.stderr = stderr;
-        reject(error);
-        return;
-      }
-
-      resolve({ stdout, stderr });
+function probeCommandAvailability(command, args = ['--version']) {
+  return new Promise((resolve) => {
+    execFile(command, args, { timeout: 5000 }, (error) => {
+      resolve(!error);
     });
   });
 }
 
-async function getFfmpegEncoders() {
-  if (!ffmpegEncodersPromise) {
-    ffmpegEncodersPromise = execFileCapture(
-      'ffmpeg',
-      ['-hide_banner', '-encoders'],
-      { maxBuffer: 1024 * 1024 * 2 }
-    )
-      .then(({ stdout }) => {
-        const encoders = new Set();
-
-        stdout.split(/\r?\n/).forEach((line) => {
-          const match = line.match(/^\s*[A-Z.]{6}\s+([^\s]+)/);
-          if (match) {
-            encoders.add(match[1]);
-          }
-        });
-
-        return encoders;
-      })
-      .catch(() => new Set());
+async function getToolAvailability() {
+  if (!toolAvailabilityPromise) {
+    toolAvailabilityPromise = probeCommandAvailability('yt-dlp', ['--version']).then((ytDlp) => ({
+      ytDlp,
+    }));
   }
 
-  return ffmpegEncodersPromise;
-}
-
-async function getPreferredVideoEncoder() {
-  const encoders = await getFfmpegEncoders();
-  return encoders.has('h264_videotoolbox') ? 'h264_videotoolbox' : 'libx264';
-}
-
-async function getPreferredAudioEncoder() {
-  const encoders = await getFfmpegEncoders();
-  return encoders.has('aac_at') ? 'aac_at' : 'aac';
-}
-
-async function probeMedia(inputPath) {
-  const { stdout } = await execFileCapture(
-    'ffprobe',
-    [
-      '-v',
-      'error',
-      '-print_format',
-      'json',
-      '-show_entries',
-      'format=format_name:stream=index,codec_type,codec_name,pix_fmt,width,height',
-      inputPath,
-    ],
-    { maxBuffer: 1024 * 1024 * 2 }
-  );
-
-  return JSON.parse(stdout);
-}
-
-function getPrimaryStream(metadata, codecType) {
-  return Array.isArray(metadata.streams)
-    ? metadata.streams.find((stream) => stream.codec_type === codecType) || null
-    : null;
-}
-
-function isEvenDimension(value) {
-  return !Number.isFinite(value) || value % 2 === 0;
-}
-
-function isMp4FamilyFormat(formatName) {
-  return String(formatName || '')
-    .split(',')
-    .some((format) => MP4_FAMILY_FORMATS.has(format.trim()));
-}
-
-function isQuickTimeReadyVideo(stream) {
-  return Boolean(
-    stream &&
-      stream.codec_name === 'h264' &&
-      (!stream.pix_fmt || stream.pix_fmt.startsWith('yuv420')) &&
-      isEvenDimension(stream.width) &&
-      isEvenDimension(stream.height)
-  );
-}
-
-function isQuickTimeReadyAudio(stream) {
-  return !stream || stream.codec_name === 'aac';
-}
-
-async function planQuickTimeOptimization(inputPath) {
-  const metadata = await probeMedia(inputPath);
-  const videoStream = getPrimaryStream(metadata, 'video');
-  const audioStream = getPrimaryStream(metadata, 'audio');
-  const containerReady = isMp4FamilyFormat(metadata.format?.format_name);
-  const videoReady = isQuickTimeReadyVideo(videoStream);
-  const audioReady = isQuickTimeReadyAudio(audioStream);
-
-  if (!videoStream) {
-    throw new Error('Downloaded file does not contain a video stream');
-  }
-
-  if (videoReady && audioReady && containerReady) {
-    return {
-      mode: 'passthrough',
-      message: 'Source already Apple-compatible. Skipping conversion.',
-      inputPath,
-      outputPath: inputPath,
-      hasAudio: Boolean(audioStream),
-    };
-  }
-
-  const parsed = path.parse(inputPath);
-  const outputPath = path.join(parsed.dir, `${parsed.name}__qt.mp4`);
-
-  if (videoReady) {
-    return {
-      mode: audioReady ? 'remux' : 'audio-transcode',
-      message: audioReady
-        ? 'Fast MP4 remux in progress...'
-        : 'Copying video and converting audio only...',
-      inputPath,
-      outputPath,
-      hasAudio: Boolean(audioStream),
-    };
-  }
-
-  const videoEncoder = await getPreferredVideoEncoder();
-  const audioEncoder = audioReady || !audioStream ? null : await getPreferredAudioEncoder();
-
-  return {
-    mode: 'full-transcode',
-    message:
-      videoEncoder === 'h264_videotoolbox'
-        ? 'Hardware-accelerated MP4 conversion in progress...'
-        : 'Fast MP4 conversion in progress...',
-    inputPath,
-    outputPath,
-    hasAudio: Boolean(audioStream),
-    videoEncoder,
-    audioEncoder,
-    copyAudio: audioReady,
-  };
+  return toolAvailabilityPromise;
 }
 
 function extractExpectedBytes(metadata) {
@@ -434,7 +345,7 @@ function fetchExpectedDownloadBytes(url) {
 }
 
 async function measurePrefixedDownloadBytes(prefix) {
-  const entries = await fsp.readdir(ROOT_DIR);
+  const entries = await fsp.readdir(WORK_DIR);
   const matchingEntries = entries.filter((entry) => entry.startsWith(prefix));
 
   if (matchingEntries.length === 0) {
@@ -443,7 +354,7 @@ async function measurePrefixedDownloadBytes(prefix) {
 
   const stats = await Promise.all(
     matchingEntries.map(async (entry) => {
-      const fullPath = path.join(ROOT_DIR, entry);
+      const fullPath = path.join(WORK_DIR, entry);
       const detail = await fsp.stat(fullPath);
       return detail.isFile() ? detail.size : 0;
     })
@@ -452,68 +363,44 @@ async function measurePrefixedDownloadBytes(prefix) {
   return stats.reduce((total, size) => total + size, 0);
 }
 
-function runProcess(command, args) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args);
-    let stderr = '';
+function buildDeliveredFileName(outputPath, requestPrefix) {
+  const sourceName = path.basename(outputPath);
+  const strippedPrefix = sourceName.startsWith(requestPrefix)
+    ? sourceName.slice(requestPrefix.length)
+    : sourceName;
 
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString();
-    });
-
-    child.on('error', reject);
-    child.on('close', (code) => {
-      if (code === 0) {
-        resolve();
-        return;
-      }
-
-      const detail = stderr.trim().split('\n').slice(-6).join(' | ');
-      reject(new Error(detail || `${command} exited with code ${code}`));
-    });
-  });
+  return strippedPrefix;
 }
 
-async function convertToQuickTimeMp4(inputPath, existingPlan = null) {
-  const plan = existingPlan || await planQuickTimeOptimization(inputPath);
+function registerCompletedDownload(filePath, fileName) {
+  const token = crypto.randomUUID();
+  const cleanupTimer = setTimeout(async () => {
+    completedDownloads.delete(token);
+    try {
+      await fsp.unlink(filePath);
+    } catch {
+      // Ignore cleanup failures for expired downloads.
+    }
+  }, DOWNLOAD_TTL_MS);
 
-  if (plan.mode === 'passthrough') {
-    return plan;
+  if (typeof cleanupTimer.unref === 'function') {
+    cleanupTimer.unref();
   }
 
-  const ffmpegArgs = ['-y', '-i', inputPath, '-map', '0:v:0', '-map', '0:a:0?'];
+  completedDownloads.set(token, {
+    filePath,
+    fileName,
+    createdAt: Date.now(),
+    cleanupTimer,
+  });
 
-  if (plan.mode === 'remux') {
-    ffmpegArgs.push('-c:v', 'copy', '-c:a', 'copy');
-  } else if (plan.mode === 'audio-transcode') {
-    const audioEncoder = await getPreferredAudioEncoder();
-    ffmpegArgs.push('-c:v', 'copy', '-c:a', audioEncoder, '-b:a', '160k');
-  } else {
-    ffmpegArgs.push('-c:v', plan.videoEncoder);
+  return token;
+}
 
-    if (plan.videoEncoder === 'h264_videotoolbox') {
-      ffmpegArgs.push('-allow_sw', '1', '-realtime', 'true', '-b:v', '6000k', '-maxrate', '8000k', '-bufsize', '12000k');
-    } else {
-      ffmpegArgs.push('-preset', 'ultrafast', '-crf', '23');
-    }
-
-    ffmpegArgs.push('-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-pix_fmt', 'yuv420p');
-
-    if (!plan.hasAudio) {
-      ffmpegArgs.push('-an');
-    } else if (plan.copyAudio) {
-      ffmpegArgs.push('-c:a', 'copy');
-    } else {
-      ffmpegArgs.push('-c:a', plan.audioEncoder, '-b:a', '160k');
-    }
-  }
-
-  ffmpegArgs.push('-movflags', '+faststart', plan.outputPath);
-
-  await runProcess('ffmpeg', ffmpegArgs);
-  await fsp.unlink(inputPath);
-
-  return plan;
+function buildAttachmentDisposition(fileName) {
+  const originalName = String(fileName || 'download');
+  const asciiFallback = sanitizeFileSegment(originalName, 'download').replace(/[^\x20-\x7E]/g, '_') || 'download';
+  return `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodeURIComponent(originalName)}`;
 }
 
 app.get('/', (req, res) => {
@@ -525,14 +412,26 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(ROOT_DIR, 'index.html'));
 });
 
-app.get('/config', (req, res) => {
-  res.json({ rootDir: ROOT_DIR });
+app.get('/config', async (req, res) => {
+  const toolAvailability = await getToolAvailability();
+
+  res.json({
+    deliveryMode: 'browser-download',
+    storagePath: COMPLETED_DIR,
+    browseSupported: false,
+    toolAvailability,
+  });
 });
 
-app.get('/info', (req, res) => {
-  const url = req.query.url;
-  if (!url) {
-    return res.status(400).json({ error: 'URL required' });
+app.get('/info', async (req, res) => {
+  const url = normalizeExternalUrl(req.query.url);
+  if (!url || !isAllowedVideoUrl(url)) {
+    return res.status(400).json({ error: 'A valid YouTube URL is required' });
+  }
+
+  const toolAvailability = await getToolAvailability();
+  if (!toolAvailability.ytDlp) {
+    return res.status(503).json({ error: 'yt-dlp is not installed on the server' });
   }
 
   execFile(
@@ -570,6 +469,10 @@ app.get('/download-thumbnail', async (req, res) => {
     return res.status(400).json({ error: 'Thumbnail URL required' });
   }
 
+  if (!isAllowedThumbnailUrl(thumbnailUrl)) {
+    return res.status(400).json({ error: 'Thumbnail host is not allowed' });
+  }
+
   try {
     const response = await fetch(thumbnailUrl, {
       headers: {
@@ -589,7 +492,10 @@ app.get('/download-thumbnail', async (req, res) => {
     )}${extension}`;
     const buffer = Buffer.from(await response.arrayBuffer());
 
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, X-Download-Filename, Content-Type');
     res.setHeader('Content-Type', contentType);
+    res.setHeader('X-Download-Filename', fileName);
     res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
     res.send(buffer);
   } catch (error) {
@@ -599,27 +505,69 @@ app.get('/download-thumbnail', async (req, res) => {
 });
 
 app.get('/browse', (req, res) => {
-  exec(
-    `osascript -e 'POSIX path of (choose folder with prompt "Select Download Destination")'`,
-    (error, stdout) => {
-      if (error) {
-        return res.status(500).json({ error: 'Folder selection cancelled or failed' });
-      }
-
-      res.json({ path: stdout.trim() });
-    }
-  );
+  res.status(501).json({ error: 'Server-side folder browsing is disabled in browser-download mode' });
 });
 
-app.get('/download', (req, res) => {
-  const url = req.query.url;
-  const requestedPath = req.query.path;
+app.get('/downloads/:token', async (req, res) => {
+  const download = completedDownloads.get(req.params.token);
 
-  if (!url) {
-    return res.status(400).end();
+  if (!download) {
+    return res.status(404).json({ error: 'Download expired or not found' });
   }
 
-  const destinationDir = resolveDestinationPath(requestedPath);
+  if (!(await fileExists(download.filePath))) {
+    clearTimeout(download.cleanupTimer);
+    completedDownloads.delete(req.params.token);
+    return res.status(404).json({ error: 'Download file is no longer available' });
+  }
+
+  try {
+    const stats = await fsp.stat(download.filePath);
+
+    if (!stats.isFile()) {
+      throw new Error('Resolved download path is not a file');
+    }
+
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Length', String(stats.size));
+    res.setHeader('Content-Disposition', buildAttachmentDisposition(download.fileName));
+
+    const stream = fs.createReadStream(download.filePath);
+
+    stream.on('error', (error) => {
+      console.error('Download stream failed:', download.filePath, error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Failed to stream download file' });
+      } else {
+        res.destroy(error);
+      }
+    });
+
+    stream.pipe(res);
+  } catch (error) {
+    console.error('Download file could not be opened:', download.filePath, error);
+    clearTimeout(download.cleanupTimer);
+    completedDownloads.delete(req.params.token);
+    return res.status(404).json({ error: 'Download file is no longer available' });
+  }
+});
+
+app.get('/download', async (req, res) => {
+  const url = normalizeExternalUrl(req.query.url);
+  const toolAvailability = await getToolAvailability();
+
+  if (!url || !isAllowedVideoUrl(url)) {
+    return res.status(400).json({ error: 'A valid YouTube URL is required' });
+  }
+
+  if (!toolAvailability.ytDlp) {
+    return res.status(503).json({ error: 'yt-dlp is not installed on the server' });
+  }
+
+  await ensureDirectory(WORK_DIR);
+  await ensureDirectory(COMPLETED_DIR);
+
   const requestPrefix = `${TEMP_PREFIX}${Date.now()}_${Math.random().toString(36).slice(2, 8)}__`;
   const outputTemplate = `${requestPrefix}%(title).150B [%(id)s].%(ext)s`;
   const expectedBytesPromise = fetchExpectedDownloadBytes(url);
@@ -634,7 +582,7 @@ app.get('/download', (req, res) => {
     '-f',
     VIDEO_FORMAT_SELECTOR,
     '-P',
-    ROOT_DIR,
+    WORK_DIR,
     '-o',
     outputTemplate,
     url,
@@ -656,14 +604,24 @@ app.get('/download', (req, res) => {
   let sizePollInFlight = false;
   let stdoutBuffer = '';
   let stderrBuffer = '';
+  let clientClosed = false;
 
-  const ytdlp = spawn('yt-dlp', args, { cwd: ROOT_DIR });
+  const ytdlp = spawn('yt-dlp', args, { cwd: WORK_DIR });
 
   expectedBytesPromise.then((value) => {
     expectedBytes = value;
   });
 
+  const sendEvent = (payload) => {
+    if (clientClosed || res.writableEnded) {
+      return;
+    }
+
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  };
+
   req.on('close', () => {
+    clientClosed = true;
     clearInterval(heartbeat);
     clearInterval(sizeFallbackInterval);
     if (!ytdlp.killed) {
@@ -704,12 +662,10 @@ app.get('/download', (req, res) => {
 
       if (Number.isFinite(progress)) {
         lastProgress = Math.max(lastProgress, progress);
-        res.write(
-          `data: ${JSON.stringify({
-            progress: Math.max(0, Math.min(100, progress)),
-            speed: speed && speed !== 'N/A' ? speed : undefined,
-          })}\n\n`
-        );
+        sendEvent({
+          progress: Math.max(0, Math.min(100, progress)),
+          speed: speed && speed !== 'N/A' ? speed : undefined,
+        });
       }
       return;
     }
@@ -719,7 +675,7 @@ app.get('/download', (req, res) => {
       const progress = parseFloat(progressMatch[1]);
       const speed = progressMatch[2];
       lastProgress = Math.max(lastProgress, progress);
-      res.write(`data: ${JSON.stringify({ progress, speed })}\n\n`);
+      sendEvent({ progress, speed });
     }
   };
 
@@ -739,7 +695,7 @@ app.get('/download', (req, res) => {
       const estimatedProgress = Math.min(99, (downloadedBytes / expectedBytes) * 100);
       if (estimatedProgress > lastProgress + 0.2) {
         lastProgress = estimatedProgress;
-        res.write(`data: ${JSON.stringify({ progress: estimatedProgress })}\n\n`);
+        sendEvent({ progress: estimatedProgress });
       }
     } catch {
       // Ignore fallback polling failures and continue with yt-dlp-driven updates.
@@ -771,7 +727,7 @@ app.get('/download', (req, res) => {
   ytdlp.on('error', () => {
     clearInterval(heartbeat);
     clearInterval(sizeFallbackInterval);
-    res.write(`data: ${JSON.stringify({ error: 'Failed to start yt-dlp' })}\n\n`);
+    sendEvent({ error: 'Failed to start yt-dlp' });
     res.end();
   });
 
@@ -788,61 +744,63 @@ app.get('/download', (req, res) => {
       clearInterval(sizeFallbackInterval);
 
       if (code !== 0) {
-        res.write(`data: ${JSON.stringify({ error: 'Download failed' })}\n\n`);
+        const detail = stderrBuffer.trim().split('\n').slice(-4).join(' | ');
+        sendEvent({ error: detail || 'Download failed' });
         return res.end();
       }
 
       if (!downloadedFilePath) {
-        downloadedFilePath = await findDownloadedFileFallback(requestPrefix);
+        downloadedFilePath = await findDownloadedFileFallback(WORK_DIR, requestPrefix);
       }
 
       if (!downloadedFilePath) {
-        res.write(`data: ${JSON.stringify({ error: 'Downloaded file was not found in the project root' })}\n\n`);
+        sendEvent({ error: 'Downloaded file was not found in the working directory' });
         return res.end();
       }
 
-      await fsp.mkdir(destinationDir, { recursive: true });
+      sendEvent({
+        progress: 99,
+        message: 'Preparing browser download...',
+      });
 
-      const conversionPlan = await planQuickTimeOptimization(downloadedFilePath);
+      const finalName = buildDeliveredFileName(downloadedFilePath, requestPrefix);
+      const targetPath = await buildUniquePath(path.join(COMPLETED_DIR, finalName));
 
-      res.write(
-        `data: ${JSON.stringify({
-          progress: 99,
-          message: conversionPlan.message,
-        })}\n\n`
-      );
+      await moveFile(downloadedFilePath, targetPath);
+      const downloadToken = registerCompletedDownload(targetPath, path.basename(targetPath));
+      const completionMessage = `Browser download ready: ${path.basename(targetPath)}`;
 
-      const conversionResult = await convertToQuickTimeMp4(downloadedFilePath, conversionPlan);
-      const sourceName = path.basename(conversionResult.outputPath);
-      const finalName = sourceName.startsWith(requestPrefix)
-        ? sourceName.slice(requestPrefix.length).replace(/__qt\.mp4$/i, '.mp4')
-        : sourceName.replace(/__qt\.mp4$/i, '.mp4');
-      const targetPath = await buildUniquePath(path.join(destinationDir, finalName));
-
-      await moveFile(conversionResult.outputPath, targetPath);
-
-      res.write(
-        `data: ${JSON.stringify({
-          progress: 100,
-          done: true,
-          optimizationMode: conversionResult.mode,
-          rootPath: path.join(ROOT_DIR, sourceName),
-          finalPath: targetPath,
-        })}\n\n`
-      );
+      sendEvent({
+        progress: 100,
+        done: true,
+        fileName: path.basename(targetPath),
+        message: completionMessage,
+        downloadUrl: `/downloads/${downloadToken}`,
+      });
       res.end();
     } catch (error) {
       clearInterval(heartbeat);
       clearInterval(sizeFallbackInterval);
       console.error('Post-download handling failed:', error);
-      res.write(`data: ${JSON.stringify({ error: 'Download finished but the file could not be moved' })}\n\n`);
+      sendEvent({
+        error: error?.message || 'Download finished but the file could not be prepared for browser delivery',
+      });
       res.end();
     }
   });
 });
 
+const HOST = process.env.HOST || '0.0.0.0';
 const PORT = Number(process.env.PORT) || 3000;
 
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+app.listen(PORT, HOST, async () => {
+  await ensureDirectory(WORK_DIR);
+  await ensureDirectory(COMPLETED_DIR);
+  const toolAvailability = await getToolAvailability();
+  const localNetworkLabel = HOST === '0.0.0.0' ? os.hostname() : HOST;
+
+  console.log(`Server running on http://${localNetworkLabel}:${PORT}`);
+  console.log(
+    `yt-dlp: ${toolAvailability.ytDlp ? 'yes' : 'no'}`
+  );
 });
