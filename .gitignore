@@ -5,4 +5,4 @@ dist
 *.log
 
 .runtime/
-.mp4/
+*.mp4
